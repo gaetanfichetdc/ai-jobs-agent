@@ -1,8 +1,8 @@
 import streamlit as st
+import extra_streamlit_components as stx
 import os
 import pandas as pd
 import plotly.express as px
-import uuid
 import requests
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -38,19 +38,24 @@ st.markdown("""
 MAX_CALLS_PER_USER = 15
 
 @st.cache_resource
-def get_global_rate_limiter():
-    return {}
+def get_cookie_manager():
+    return stx.CookieManager()
 
-global_limiter = get_global_rate_limiter()
+cookie_manager = get_cookie_manager()
 
-def get_user_identifier():
-    if "fallback_uuid" not in st.session_state:
-        st.session_state.fallback_uuid = str(uuid.uuid4())
-    return st.session_state.fallback_uuid
+def get_query_count() -> int:
+    val = cookie_manager.get("ai_agent_queries")
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return 0
 
-user_key = get_user_identifier()
-if user_key not in global_limiter:
-    global_limiter[user_key] = 0
+def set_query_count(count: int):
+    cookie_manager.set("ai_agent_queries", str(count), max_age=60 * 60 * 24)
+
+query_count = get_query_count()
 
 # ==========================================
 # 2. Dataset Load & Sidebar Stats
@@ -75,7 +80,7 @@ with st.sidebar:
     unique_cities = df['city'].dropna().nunique() if 'city' in df.columns else df['country'].dropna().nunique()
     col2.metric("Unique Cities", unique_cities)
     st.markdown("---")
-    remaining_queries = max(0, MAX_CALLS_PER_USER - global_limiter[user_key])
+    remaining_queries = max(0, MAX_CALLS_PER_USER - query_count)
     st.info(f"🔑 Queries Remaining: {remaining_queries} / {MAX_CALLS_PER_USER}")
 
 # ==========================================
@@ -183,13 +188,24 @@ def render_plotly_chart(chart_type: str, column: str, group_by: str | None = Non
 # ==========================================
 # 5. Agent Tools
 # ==========================================
+def _get_reference_rows(data: pd.DataFrame, column: str, metric: str, n: int = 5) -> pd.DataFrame:
+    """Return a small sample of rows that back the computed statistic."""
+    target = 'salary_max' if column == 'salary' else column
+    show_cols = [c for c in ['job_title', 'company', 'city', 'country', target] if c in data.columns]
+    if metric == "max":
+        return data.nlargest(n, target)[show_cols]
+    elif metric == "min":
+        return data.nsmallest(n, target)[show_cols]
+    else:
+        return data.dropna(subset=[target]).sample(n=min(n, len(data)), random_state=42)[show_cols]
+
 @tool
 def calculate_job_stat(metric: str, column: str, country: str = "All"):
     """Calculates statistical operations (mean, max, min, count) for filtered segments."""
     data = filter_dataframe_by_location(df, country)
     if data.empty: return f"0 rows found for location filter context: '{country}'."
     if metric.lower() == "count": return f"{len(data)} total positions found."
-    
+
     target = 'salary_max' if column == 'salary' else column
     if metric == "mean": return f"${float(data[target].mean()):,.2f}"
     if metric == "max": return f"${float(data[target].max()):,.2f}"
@@ -226,19 +242,23 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 for idx, msg in enumerate(st.session_state.messages):
-    with st.chat_message(msg["role"]): 
+    with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "chart_args" in msg and msg["chart_args"]:
-            render_plotly_chart(**msg["chart_args"], key=f"hist_{idx}")
+            with st.expander("📊 Chart", expanded=(idx >= len(st.session_state.messages) - 2)):
+                render_plotly_chart(**msg["chart_args"], key=f"hist_{idx}")
+        if "references" in msg and msg["references"] is not None:
+            with st.expander("📋 Supporting data", expanded=(idx >= len(st.session_state.messages) - 2)):
+                st.dataframe(msg["references"], use_container_width=True, hide_index=True)
 
-if global_limiter[user_key] < MAX_CALLS_PER_USER:
+if query_count < MAX_CALLS_PER_USER:
     if prompt := st.chat_input(placeholder="Ask me anything about the data..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"): 
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            global_limiter[user_key] += 1
+            set_query_count(query_count + 1)
             langchain_messages = [SystemMessage(content=system_prompt)]
             for m in st.session_state.messages:
                 role = HumanMessage if m["role"] == "user" else AIMessage
@@ -246,16 +266,22 @@ if global_limiter[user_key] < MAX_CALLS_PER_USER:
 
             response = llm_with_tools.invoke(langchain_messages)
             chart_to_save = None
-            
+            refs_to_save = None
+
             if response.tool_calls:
                 tc = response.tool_calls[0]
                 if tc['name'] == 'calculate_job_stat':
                     tool_output = calculate_job_stat.invoke(tc['args'])
+                    try:
+                        filtered = filter_dataframe_by_location(df, tc['args'].get('country', 'All'))
+                        refs_to_save = _get_reference_rows(filtered, tc['args'].get('column', 'salary'), tc['args'].get('metric', 'mean'))
+                    except Exception:
+                        pass
                 else:
                     tool_output = plot_job_data.invoke(tc['args'])
-                    if "Error" not in str(tool_output): 
+                    if "Error" not in str(tool_output):
                         chart_to_save = tc['args']
-                
+
                 langchain_messages.append(response)
                 langchain_messages.append(ToolMessage(content=str(tool_output), tool_call_id=tc['id']))
                 final_response = llm.invoke(langchain_messages)
@@ -263,13 +289,17 @@ if global_limiter[user_key] < MAX_CALLS_PER_USER:
                 st.markdown(assistant_content)
                 if chart_to_save:
                     render_plotly_chart(**chart_to_save, key="active_chart")
+                if refs_to_save is not None:
+                    with st.expander("📋 Supporting data", expanded=True):
+                        st.dataframe(refs_to_save, use_container_width=True, hide_index=True)
             else:
                 assistant_content = llm.invoke(langchain_messages).content
                 st.markdown(assistant_content)
-                
+
             st.session_state.messages.append({
-                "role": "assistant", 
-                "content": assistant_content, 
-                "chart_args": chart_to_save
+                "role": "assistant",
+                "content": assistant_content,
+                "chart_args": chart_to_save,
+                "references": refs_to_save if refs_to_save is not None else None,
             })
             st.rerun()
