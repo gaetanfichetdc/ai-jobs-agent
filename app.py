@@ -1,5 +1,5 @@
 import streamlit as st
-import extra_streamlit_components as stx
+import streamlit.components.v1 as components
 import os
 import pandas as pd
 import plotly.express as px
@@ -18,8 +18,8 @@ st.set_page_config(page_title="AI Jobs Data Agent", layout="wide", page_icon="�
 st.markdown("""
 <style>
     [data-testid="stSidebar"] div[data-testid="stMetric"] {
-        background-color: #1e293b !important; 
-        padding: 15px !important; 
+        background-color: #1e293b !important;
+        padding: 15px !important;
         border-radius: 10px !important;
         border: 1px solid #334155 !important;
     }
@@ -37,28 +37,36 @@ st.markdown("""
 
 MAX_CALLS_PER_USER = 15
 
-cookie_manager = stx.CookieManager()
+if "query_count" not in st.session_state:
+    st.session_state.query_count = 0
+if "cookie_loaded" not in st.session_state:
+    st.session_state.cookie_loaded = False
 
-def get_query_count() -> int:
-    val = cookie_manager.get("ai_agent_queries")
-    if val is None:
-        return 0
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return 0
+if not st.session_state.cookie_loaded:
+    cookie_val = st.query_params.get("_qc")
+    if cookie_val is not None:
+        try:
+            st.session_state.query_count = int(cookie_val)
+        except (ValueError, TypeError):
+            pass
+        st.query_params.pop("_qc", None)
+    st.session_state.cookie_loaded = True
 
-def set_query_count(count: int):
-    cookie_manager.set("ai_agent_queries", str(count), max_age=60 * 60 * 24)
-
-query_count = get_query_count()
+def bump_query_count():
+    st.session_state.query_count += 1
+    count = st.session_state.query_count
+    components.html(
+        f"""<script>
+        document.cookie = "ai_agent_queries={count}; max-age=86400; path=/; SameSite=Lax";
+        </script>""",
+        height=0,
+    )
 
 # ==========================================
 # 2. Dataset Load & Sidebar Stats
 # ==========================================
 @st.cache_data
-def load_data(): 
-    # Clean string conversions on load to prevent type casting failures later
+def load_data():
     data = pd.read_csv('ai_jobs_global_geocoded.csv')
     if 'lat' in data.columns:
         data['lat'] = pd.to_numeric(data['lat'], errors='coerce')
@@ -72,11 +80,11 @@ with st.sidebar:
     st.header("📊 Dataset Overview")
     col1, col2 = st.columns(2)
     col1.metric("Total Jobs", len(df))
-    
+
     unique_cities = df['city'].dropna().nunique() if 'city' in df.columns else df['country'].dropna().nunique()
     col2.metric("Unique Cities", unique_cities)
     st.markdown("---")
-    remaining_queries = max(0, MAX_CALLS_PER_USER - query_count)
+    remaining_queries = max(0, MAX_CALLS_PER_USER - st.session_state.query_count)
     st.info(f"🔑 Queries Remaining: {remaining_queries} / {MAX_CALLS_PER_USER}")
 
 # ==========================================
@@ -85,12 +93,11 @@ with st.sidebar:
 def filter_dataframe_by_location(data: pd.DataFrame, location_query: str | None) -> pd.DataFrame:
     if not location_query or location_query.lower() == "all":
         return data
-    
+
     tokens = [t.strip().lower() for t in location_query.split(",") if t.strip()]
     masks = []
-    
+
     for q in tokens:
-        # Robust substring matching to bypass strict equality limits
         if q in ["usa", "united states", "us", "u.s.", "u.s.a."]:
             pattern = "us|united states|america"
             c_mask = data['country'].str.lower().str.contains(pattern, na=False) if 'country' in data.columns else pd.Series(False, index=data.index)
@@ -106,7 +113,7 @@ def filter_dataframe_by_location(data: pd.DataFrame, location_query: str | None)
             t_mask = data['city'].str.lower().str.contains(q, na=False) if 'city' in data.columns else pd.Series(False, index=data.index)
             mask = c_mask | t_mask
         masks.append(mask)
-    
+
     if not masks:
         return data
     return data[pd.concat(masks, axis=1).any(axis=1)]
@@ -116,7 +123,7 @@ def filter_dataframe_by_location(data: pd.DataFrame, location_query: str | None)
 # ==========================================
 def render_plotly_chart(chart_type: str, column: str, group_by: str | None = None, countries_filter: str | None = "All", key: str | None = None):
     plot_df = filter_dataframe_by_location(df.copy(), countries_filter)
-    
+
     if plot_df.empty:
         st.warning(f"⚠️ No rows matched the filter condition: '{countries_filter}'")
         return
@@ -126,30 +133,28 @@ def render_plotly_chart(chart_type: str, column: str, group_by: str | None = Non
             if 'lat' not in plot_df.columns or 'lon' not in plot_df.columns:
                 st.error("❌ Spatial Error: 'lat' or 'lon' coordinate columns are missing from the dataset.")
                 return
-                
-            # Clear invalid/blank coordinate properties safely
+
             map_df = plot_df.dropna(subset=['lat', 'lon']).copy()
-            
+
             if map_df.empty:
                 st.error(f"❌ Geographic Failure: Matched records for '{countries_filter}', but those rows contain blank coordinates.")
                 return
-                
+
             if 'full_location' not in map_df.columns:
                 if 'city' in map_df.columns:
                     map_df['full_location'] = map_df['city'].astype(str) + ", " + map_df['country'].astype(str)
                 else:
                     map_df['full_location'] = map_df['country'].astype(str)
-            
-            # Group by geographic signatures directly
+
             map_data = map_df.groupby(['lat', 'lon', 'full_location']).size().reset_index(name='Job Offers')
-                
+
             fig = px.scatter_geo(
                 map_data, lat='lat', lon='lon', size='Job Offers', color='Job Offers',
                 hover_name='full_location', size_max=22,
                 title=f"City-Level Distribution of AI Job Offers ({countries_filter.upper()})",
                 color_continuous_scale=px.colors.sequential.Plasma
             )
-            
+
             q_clean = countries_filter.lower().strip()
             if any(term in q_clean for term in ["usa", "united states", "us"]):
                 fig.update_geos(scope="usa", showlakes=True, lakecolor="rgb(255, 255, 255)")
@@ -157,21 +162,21 @@ def render_plotly_chart(chart_type: str, column: str, group_by: str | None = Non
                 fig.update_geos(scope="europe")
             else:
                 fig.update_geos(projection_type="natural earth")
-                
+
             fig.update_layout(
-                margin={"r":0,"t":50,"l":0,"b":0}, 
+                margin={"r":0,"t":50,"l":0,"b":0},
                 geo=dict(bgcolor='rgba(0,0,0,0)', showland=True, landcolor="rgb(243, 244, 246)")
             )
 
     elif chart_type == "box":
         target_col = 'salary_max' if column == 'salary' else column
         fig = px.box(plot_df, y=target_col, x=group_by, color=group_by, title="Salary Distributions")
-        
-    else: 
+
+    else:
         active_color = group_by if group_by in plot_df.columns else None
         if not active_color and (',' in str(countries_filter) or countries_filter.lower() == 'all'):
             active_color = 'country'
-            
+
         target_col = 'salary_max' if column == 'salary' else column
         fig = px.histogram(
             plot_df, x=target_col, color=active_color,
@@ -234,7 +239,7 @@ Available columns: {', '.join(df.columns.tolist())}
 llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.getenv("GROQ_API_KEY"))
 llm_with_tools = llm.bind_tools([calculate_job_stat, plot_job_data])
 
-if "messages" not in st.session_state: 
+if "messages" not in st.session_state:
     st.session_state.messages = []
 
 for idx, msg in enumerate(st.session_state.messages):
@@ -247,14 +252,13 @@ for idx, msg in enumerate(st.session_state.messages):
             with st.expander("📋 Supporting data", expanded=(idx >= len(st.session_state.messages) - 2)):
                 st.dataframe(msg["references"], use_container_width=True, hide_index=True)
 
-if query_count < MAX_CALLS_PER_USER:
+if st.session_state.query_count < MAX_CALLS_PER_USER:
     if prompt := st.chat_input(placeholder="Ask me anything about the data..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"): 
+        with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            set_query_count(query_count + 1)
             langchain_messages = [SystemMessage(content=system_prompt)]
             for m in st.session_state.messages:
                 role = HumanMessage if m["role"] == "user" else AIMessage
@@ -298,4 +302,5 @@ if query_count < MAX_CALLS_PER_USER:
                 "chart_args": chart_to_save,
                 "references": refs_to_save if refs_to_save is not None else None,
             })
+            bump_query_count()
             st.rerun()
