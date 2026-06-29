@@ -192,13 +192,16 @@ def render_plotly_chart(chart_type: str, column: str, group_by: str | None = Non
 def _get_reference_rows(data: pd.DataFrame, column: str, metric: str, n: int = 5) -> pd.DataFrame:
     """Return a small sample of rows that back the computed statistic."""
     target = 'salary_max' if column == 'salary' else column
-    show_cols = [c for c in ['job_title', 'company', 'city', 'country', target] if c in data.columns]
+    show_cols = list(dict.fromkeys(c for c in ['job_title', 'company', 'city', 'country', target] if c in data.columns))
     if metric == "max":
-        return data.nlargest(n, target)[show_cols]
+        result = data.nlargest(n, target)[show_cols]
     elif metric == "min":
-        return data.nsmallest(n, target)[show_cols]
+        result = data.nsmallest(n, target)[show_cols]
+    elif metric == "count":
+        result = data.sample(n=min(n, len(data)), random_state=42)[show_cols]
     else:
-        return data.dropna(subset=[target]).sample(n=min(n, len(data)), random_state=42)[show_cols]
+        result = data.dropna(subset=[target]).sample(n=min(n, len(data)), random_state=42)[show_cols]
+    return result.reset_index(drop=True)
 
 @tool
 def calculate_job_stat(metric: str, column: str, country: str = "All"):
@@ -249,7 +252,7 @@ for idx, msg in enumerate(st.session_state.messages):
             with st.expander("📊 Chart", expanded=(idx >= len(st.session_state.messages) - 2)):
                 render_plotly_chart(**msg["chart_args"], key=f"hist_{idx}")
         if "references" in msg and msg["references"] is not None:
-            with st.expander("📋 Supporting data", expanded=(idx >= len(st.session_state.messages) - 2)):
+            with st.expander("📋 Supporting data", expanded=False):
                 st.dataframe(msg["references"], use_container_width=True, hide_index=True)
 
 if st.session_state.query_count < MAX_CALLS_PER_USER:
@@ -290,7 +293,7 @@ if st.session_state.query_count < MAX_CALLS_PER_USER:
                 if chart_to_save:
                     render_plotly_chart(**chart_to_save, key="active_chart")
                 if refs_to_save is not None:
-                    with st.expander("📋 Supporting data", expanded=True):
+                    with st.expander("📋 Supporting data", expanded=False):
                         st.dataframe(refs_to_save, use_container_width=True, hide_index=True)
             else:
                 assistant_content = llm.invoke(langchain_messages).content
