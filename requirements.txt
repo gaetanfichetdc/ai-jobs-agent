@@ -1,0 +1,12 @@
+streamlit
+pandas
+plotly
+langchain
+langchain-chroma
+langchain-community
+langchain-huggingface
+langchain-groq
+langchain-core
+sentence-transformers
+chromadb
+requests
