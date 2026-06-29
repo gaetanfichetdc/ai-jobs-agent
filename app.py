@@ -37,11 +37,7 @@ st.markdown("""
 
 MAX_CALLS_PER_USER = 15
 
-@st.cache_resource
-def get_cookie_manager():
-    return stx.CookieManager()
-
-cookie_manager = get_cookie_manager()
+cookie_manager = stx.CookieManager()
 
 def get_query_count() -> int:
     val = cookie_manager.get("ai_agent_queries")
