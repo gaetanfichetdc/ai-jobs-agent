@@ -76,6 +76,13 @@ def load_data():
 
 df = load_data()
 
+@st.cache_resource
+def load_vector_store():
+    embedding_function = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return Chroma(persist_directory="./chroma_db", embedding_function=embedding_function)
+
+vector_store = load_vector_store()
+
 with st.sidebar:
     st.header("📊 Dataset Overview")
     col1, col2 = st.columns(2)
@@ -222,6 +229,34 @@ def plot_job_data(chart_type: str, column: str, group_by: str | None = None, cou
     if check_df.empty: return f"Error: No records match '{countries_filter}'."
     return f"Successfully initialized the layout for {chart_type}."
 
+def _build_retrieval_reference_rows(results) -> pd.DataFrame:
+    """Return the retrieved postings as a small dataframe, for the same 'Supporting data' UI panel used by the stats tool."""
+    rows = []
+    for doc in results:
+        rows.append({
+            "company": doc.metadata.get("source", "Unknown"),
+            "city": doc.metadata.get("city", "Unknown"),
+            "country": doc.metadata.get("country", "Unknown"),
+            "description_snippet": doc.page_content[:200].replace("\n", " ") + "...",
+        })
+    return pd.DataFrame(rows)
+
+@tool
+def search_job_descriptions(query: str, k: int = 5):
+    """Semantically searches job description text for qualitative questions (required skills, responsibilities,
+    seniority, tech stack, etc.) that plain filtering or statistics can't answer. Returns the most relevant postings."""
+    results = vector_store.similarity_search(query, k=k)
+    if not results:
+        return "No matching job descriptions found."
+    lines = []
+    for doc in results:
+        company = doc.metadata.get("source", "Unknown")
+        city = doc.metadata.get("city", "Unknown")
+        country = doc.metadata.get("country", "Unknown")
+        snippet = doc.page_content[:200].replace("\n", " ")
+        lines.append(f"- {company} ({city}, {country}): {snippet}...")
+    return "\n".join(lines)
+
 # ==========================================
 # 6. Agent Orchestration Loop
 # ==========================================
@@ -235,12 +270,13 @@ Tool usage:
 - For salary comparisons: chart_type="histogram", column="salary", countries_filter=<locations comma-separated>, group_by="country".
 - For salary distributions: chart_type="box", column="salary", group_by=<grouping column>.
 - For statistics: use calculate_job_stat with metric (mean/max/min/count), column, and country filter.
+- For qualitative questions about what a job actually involves, required skills, responsibilities, seniority, or tech stack, that plain stats/filters can't answer, use search_job_descriptions with a natural-language query.
 
 Available columns: {', '.join(df.columns.tolist())}
 """
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.getenv("GROQ_API_KEY"))
-llm_with_tools = llm.bind_tools([calculate_job_stat, plot_job_data])
+llm = ChatGroq(model="openai/gpt-oss-120b", api_key=os.getenv("GROQ_API_KEY"), model_kwargs={"include_reasoning": False})
+llm_with_tools = llm.bind_tools([calculate_job_stat, plot_job_data, search_job_descriptions])
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -278,6 +314,13 @@ if st.session_state.query_count < MAX_CALLS_PER_USER:
                     try:
                         filtered = filter_dataframe_by_location(df, tc['args'].get('country', 'All'))
                         refs_to_save = _get_reference_rows(filtered, tc['args'].get('column', 'salary'), tc['args'].get('metric', 'mean'))
+                    except Exception:
+                        pass
+                elif tc['name'] == 'search_job_descriptions':
+                    tool_output = search_job_descriptions.invoke(tc['args'])
+                    try:
+                        results = vector_store.similarity_search(tc['args'].get('query', ''), k=tc['args'].get('k', 5))
+                        refs_to_save = _build_retrieval_reference_rows(results)
                     except Exception:
                         pass
                 else:
